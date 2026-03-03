@@ -69,6 +69,7 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
                  symmetric: Optional[bool] = True,
                  actorder: Optional[ActivationOrdering] = None):
 
+        self._use_dequant_fallback = False
         self.pack_factor = 32 // num_bits
         self.strategy = strategy
         self.symmetric = symmetric
@@ -224,11 +225,14 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             c.group_size,
         )
         if not supported:
-            raise ValueError(
-                f"Marlin does not support this layer shape: {err_msg}. "
-                "This should have been caught earlier by the Marlin "
-                "compatibility check in get_quant_method()."
+            logger.warning(
+                "Layer is not Marlin-compatible (%s). "
+                "Dequantizing to %s for this layer.",
+                err_msg,
+                c.act_type,
             )
+            self._dequant_fallback(layer, c)
+            return
 
         row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
         self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
@@ -306,8 +310,61 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         _transform_param(layer, self.w_q_name, transform_w_q)
         _transform_param(layer, self.w_s_name, transform_w_s)
 
+    def _dequant_fallback(self, layer: torch.nn.Module,
+                          c: MarlinLinearLayerConfig) -> None:
+        """Dequantize packed weights for layers incompatible with Marlin.
+
+        Unpacks the int32-packed quantized weights, applies scales (and zero
+        points for asymmetric quantization), and stores the result as a
+        regular fp16/bf16 parameter so apply_weights can use F.linear.
+        """
+        self._use_dequant_fallback = True
+
+        num_bits = c.weight_type.size_bits
+        out_features = c.partition_weight_shape[1]
+        in_features = c.partition_weight_shape[0]
+        group_size = c.group_size if c.group_size != -1 else in_features
+
+        # Unpack quantized weights from int32 → per-element ints
+        # packed: [out_features, in_features // pack_factor]
+        # unpacked: [out_features, in_features]
+        w_packed = getattr(layer, self.w_q_name).data
+        w_unpacked = unpack_cols(w_packed, num_bits, out_features, in_features)
+
+        # Scales: [out_features, num_groups]
+        w_scales = getattr(layer, self.w_s_name).data.float()
+        scales_expanded = w_scales.repeat_interleave(
+            group_size, dim=1)[:, :in_features]
+
+        if c.zero_points:
+            # Asymmetric: unpack zero points and subtract
+            w_zp = getattr(layer, self.w_zp_name).data
+            num_groups = w_scales.shape[1]
+            zp_unpacked = unpack_cols(
+                w_zp.t(), num_bits, num_groups, out_features
+            ).t()  # [out_features, num_groups]
+            zp_expanded = zp_unpacked.float().repeat_interleave(
+                group_size, dim=1)[:, :in_features]
+            dequant = (w_unpacked.float() - zp_expanded) * scales_expanded
+        else:
+            # Symmetric: subtract midpoint offset
+            offset = 1 << (num_bits - 1)
+            dequant = (w_unpacked.float() - offset) * scales_expanded
+
+        # Store as act_type (fp16/bf16) parameter, reusing weight_packed slot
+        replace_parameter(
+            layer, self.w_q_name,
+            torch.nn.Parameter(
+                dequant.to(c.act_type).contiguous(), requires_grad=False))
+
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
                       bias: Optional[torch.Tensor]) -> torch.Tensor:
+        # Fallback path: layer was dequantized because Marlin can't handle
+        # the shape (e.g. small TP-sharded DeltaNet projections).
+        if self._use_dequant_fallback:
+            w = getattr(layer, self.w_q_name)
+            return torch.nn.functional.linear(x, w, bias)
+
         c = self.kernel_config
 
         def _get_weight_params(
