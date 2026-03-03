@@ -217,12 +217,18 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         device = getattr(layer, self.w_q_name).device
         c = self.kernel_config
 
-        check_marlin_supports_shape(
+        supported, err_msg = check_marlin_supports_shape(
             c.partition_weight_shape[1],  # out_features
             c.partition_weight_shape[0],  # in_features
             c.full_weight_shape[0],  # in_features
             c.group_size,
         )
+        if not supported:
+            raise ValueError(
+                f"Marlin does not support this layer shape: {err_msg}. "
+                "This should have been caught earlier by the Marlin "
+                "compatibility check in get_quant_method()."
+            )
 
         row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
         self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)

@@ -171,6 +171,23 @@ class CompressedTensorsConfig(QuantizationConfig):
             scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
             if scheme is None:
                 return UnquantizedLinearMethod()
+            # Marlin kernels require output_size_per_partition % 64 == 0 and
+            # input_size_per_partition % 128 == 0. When tensor parallelism
+            # shards a small layer below these minimums (e.g. DeltaNet
+            # in_proj_a/b with output_size=64 at tp>1), fall back to
+            # unquantized computation for that layer.
+            if isinstance(scheme, CompressedTensorsWNA16):
+                from sglang.srt.layers.quantization.marlin_utils import (
+                    check_marlin_supports_layer,
+                )
+                if not check_marlin_supports_layer(layer, scheme.group_size):
+                    logger.warning_once(
+                        "Layer '%s' is not Marlin-compatible "
+                        "(dimensions too small after TP sharding). "
+                        "Falling back to unquantized.",
+                        prefix,
+                    )
+                    return UnquantizedLinearMethod()
             layer.scheme = scheme
             return CompressedTensorsLinearMethod(self)
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
