@@ -351,23 +351,11 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             offset = 1 << (num_bits - 1)
             dequant = (w_unpacked.float() - offset) * scales_expanded
 
-        # Sanity check: log weight stats for debugging
-        dequant_final = dequant.to(c.act_type).contiguous()
-        logger.warning(
-            "Dequant fallback stats: shape=%s, dtype=%s, "
-            "min=%.4f, max=%.4f, mean=%.4f, nan=%d, inf=%d",
-            list(dequant_final.shape), dequant_final.dtype,
-            dequant_final.float().min().item(),
-            dequant_final.float().max().item(),
-            dequant_final.float().mean().item(),
-            torch.isnan(dequant_final).sum().item(),
-            torch.isinf(dequant_final).sum().item(),
-        )
-
         # Store as act_type (fp16/bf16) parameter, reusing weight_packed slot
         replace_parameter(
             layer, self.w_q_name,
-            torch.nn.Parameter(dequant_final, requires_grad=False))
+            torch.nn.Parameter(
+                dequant.to(c.act_type).contiguous(), requires_grad=False))
 
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
                       bias: Optional[torch.Tensor]) -> torch.Tensor:
@@ -375,16 +363,7 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         # the shape (e.g. small TP-sharded DeltaNet projections).
         if self._use_dequant_fallback:
             w = getattr(layer, self.w_q_name)
-            out = torch.nn.functional.linear(x, w, bias)
-            if torch.isnan(out).any():
-                logger.error(
-                    "NaN in DEQUANT FALLBACK output! "
-                    "x: nan=%d, w: nan=%d, out: nan=%d",
-                    torch.isnan(x).sum().item(),
-                    torch.isnan(w).sum().item(),
-                    torch.isnan(out).sum().item(),
-                )
-            return out
+            return torch.nn.functional.linear(x, w, bias)
 
         c = self.kernel_config
 
@@ -407,7 +386,7 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
 
         # `process_weights_after_loading` will ensure w_zp and w_gidx are not
         #  None for marlin
-        out = apply_gptq_marlin_linear(
+        return apply_gptq_marlin_linear(
             input=x,
             weight=w_q,
             weight_scale=w_s,
@@ -421,12 +400,3 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             is_k_full=self.is_k_full,
             bias=bias,
         )
-        if torch.isnan(out).any():
-            logger.error(
-                "NaN in MARLIN output! shape=%s, "
-                "x_nan=%d, out_nan=%d",
-                list(out.shape),
-                torch.isnan(x).sum().item(),
-                torch.isnan(out).sum().item(),
-            )
-        return out
