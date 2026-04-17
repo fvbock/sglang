@@ -285,7 +285,6 @@ class Gemma4Detector(BaseFormatDetector):
             if not matches:
                 return StreamingParseResult(normal_text=text)
 
-            tool_indices = self._get_tool_indices(tools)
             for i, (func_name, args_str) in enumerate(matches):
                 arguments = _parse_gemma4_args(args_str)
                 calls.append(
